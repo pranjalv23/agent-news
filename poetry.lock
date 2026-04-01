@@ -56,8 +56,8 @@ python-dotenv = ">=1.2.2,<2.0.0"
 [package.source]
 type = "git"
 url = "https://github.com/pranjalv23/agent-sdk.git"
-reference = "v0.1.40"
-resolved_reference = "48c14101fa1bd5288a2d1d0bcc464cda960a2270"
+reference = "v0.1.41"
+resolved_reference = "bf44817580f770d5338c2ffe67b1973134e6c5a4"
 
 [[package]]
 name = "annotated-doc"
@@ -4453,4 +4453,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "8c361604e3b4a87d0c384f01d39435c509da1e3ba9142836742e73ce08d82246"
+content-hash = "5ab6d6604fe9e15cb870d6e7fcb6845203dc343b58ed3c415f5b9ec374e99227"
