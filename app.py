@@ -1,53 +1,30 @@
+import asyncio
 import json
 import logging
 import os
-import re
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from agent_sdk.logging import configure_logging
+from agent_sdk.context import request_id_var, user_id_var
+from agent_sdk.metrics import metrics_response
+from agent_sdk.server.streaming import StreamingMathFixer, _fix_math_delimiters
 from agents.agent import create_agent, run_query, create_stream, save_memory, _fix_flash_card_format
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 
-class _JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        doc = {
-            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-        }
-        if record.exc_info:
-            doc["exc"] = self.formatException(record.exc_info)
-        return json.dumps(doc, ensure_ascii=False)
-
-_handler = logging.StreamHandler()
-_handler.setFormatter(_JsonFormatter())
-logging.root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
-logging.root.addHandler(_handler)
+configure_logging("agent_news")
 logger = logging.getLogger("agent_news.api")
 limiter = Limiter(key_func=get_remote_address)
-
-
-def _fix_math_delimiters(text: str) -> str:
-    r"""
-    Fixes math delimiters in the agent's response to ensure correct rendering in the UI.
-    Converts \[...\] to $$...$$ and \(...\) to $...$.
-    """
-    # \[...\]  →  $$...$$   (display math — must run before inline to avoid overlap)
-    text = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", text, flags=re.DOTALL)
-    # \(...\)  →  $...$     (inline math)
-    text = re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
-    return text
 
 
 @asynccontextmanager
@@ -78,13 +55,26 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Internal-API-Key", "X-User-Id", "X-Request-ID"],
 )
+
+_PUBLIC_PATHS = {"/health", "/metrics", "/docs", "/openapi.json", "/a2a/.well-known/agent.json"}
+
+@app.middleware("http")
+async def inject_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    tok_r = request_id_var.set(request_id)
+    tok_u = user_id_var.set(request.headers.get("X-User-Id"))
+    response = await call_next(request)
+    request_id_var.reset(tok_r)
+    user_id_var.reset(tok_u)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 @app.middleware("http")
 async def verify_internal_key(request: Request, call_next):
-    if request.url.path not in ["/health", "/docs", "/openapi.json", "/a2a/.well-known/agent.json"]:
+    if request.url.path not in _PUBLIC_PATHS:
         expected = os.getenv("INTERNAL_API_KEY")
         if expected and request.headers.get("X-Internal-API-Key") != expected:
             return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"detail": "Unauthorized internal access"})
@@ -157,17 +147,26 @@ async def ask_stream(request: Request, body: AskRequest):
     logger.info("POST /ask/stream — session='%s', user='%s', query='%s'",
                 session_id, user_id or "anonymous", body.query[:100])
 
-    stream = await create_stream(body.query, session_id=session_id,
-                           response_format=body.response_format, model_id=body.model_id,
-                           user_id=user_id)
+    raw_stream = await create_stream(body.query, session_id=session_id,
+                                     response_format=body.response_format, model_id=body.model_id,
+                                     user_id=user_id)
+    stream = StreamingMathFixer(raw_stream)
+
+    _STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT_SECONDS", "300"))
 
     async def event_stream():
         full_response = []
         try:
             try:
-                async for chunk in stream:
-                    full_response.append(chunk)
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+                async with asyncio.timeout(_STREAM_TIMEOUT):
+                    async for chunk in stream:
+                        full_response.append(chunk)
+                        yield f"data: {json.dumps({'text': chunk})}\n\n"
+            except TimeoutError:
+                logger.error("Stream timed out after %.0fs", _STREAM_TIMEOUT)
+                fallback = "\n\n[Response timed out. Please try a shorter query.]"
+                yield f"data: {json.dumps({'text': fallback})}\n\n"
+                full_response.append(fallback)
             except Exception as e:
                 logger.error("Stream failed: %s", e)
                 fallback = "\n\n[An error occurred while generating the response.]"
@@ -175,7 +174,6 @@ async def ask_stream(request: Request, body: AskRequest):
                 full_response.append(fallback)
 
             response_text = "".join(full_response)
-            response_text = _fix_math_delimiters(response_text)
 
             if not response_text.strip():
                 fallback = "Sorry, the model returned an empty response. Please try again or switch to a different model."
@@ -187,12 +185,11 @@ async def ask_stream(request: Request, body: AskRequest):
 
             try:
                 save_memory(user_id=user_id or session_id, query=body.query, response=response_text)
-
                 await MongoDB.save_conversation(
                     session_id=session_id,
                     query=body.query,
                     response=response_text,
-                    steps=stream.steps,
+                    steps=raw_stream.steps,
                     user_id=user_id,
                 )
             except Exception as e:
@@ -221,6 +218,12 @@ async def get_history(session_id: str):
     history = await MongoDB.get_history(session_id)
     logger.info("Returning %d history entries for session='%s'", len(history), session_id)
     return HistoryResponse(session_id=session_id, history=history)
+
+
+@app.get("/metrics")
+async def metrics():
+    content, content_type = metrics_response()
+    return Response(content=content, media_type=content_type)
 
 
 @app.get("/health")
