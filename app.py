@@ -140,6 +140,7 @@ async def ask(request: Request, body: AskRequest):
         response=response,
         steps=steps,
         user_id=user_id,
+        plan=result.get("plan"),
     )
 
     logger.info("POST /ask complete — session='%s', response length: %d chars, tool_calls: %d",
@@ -218,6 +219,7 @@ async def ask_stream(request: Request, body: AskRequest):
                     response=response_text,
                     steps=raw_stream.steps,
                     user_id=user_id,
+                    plan=raw_stream.plan,
                 )
             except Exception as e:
                 logger.error("Failed to save memory/conversation: %s", e)
