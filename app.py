@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -17,7 +17,7 @@ from slowapi.util import get_remote_address
 from agent_sdk.logging import configure_logging
 from agent_sdk.context import request_id_var, user_id_var
 from agent_sdk.metrics import metrics_response
-from agent_sdk.server.streaming import StreamingMathFixer, _fix_math_delimiters
+from agent_sdk.metrics import metrics_response
 from agents.agent import create_agent, run_query, create_stream, save_memory
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
@@ -97,7 +97,7 @@ app.mount("/a2a", a2a_app.build())
 
 
 class AskRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=8000)
     session_id: str | None = None
     response_format: str | None = None
     model_id: str | None = None
@@ -114,6 +114,29 @@ class AskResponse(BaseModel):
 class HistoryResponse(BaseModel):
     session_id: str
     history: list[dict]
+
+class LockCache:
+    def __init__(self, ttl: int = 3600):
+        self._locks = {}
+        self._timestamps = {}
+        self._ttl = ttl
+
+    def get_lock(self, session_id: str) -> asyncio.Lock:
+        now = time.time()
+        expired = [sid for sid, ts in self._timestamps.items() if now - ts > self._ttl]
+        for sid in expired:
+            if sid in self._locks and not self._locks[sid].locked():
+                del self._locks[sid]
+                del self._timestamps[sid]
+        if session_id not in self._locks:
+            self._locks[session_id] = asyncio.Lock()
+        self._timestamps[session_id] = now
+        return self._locks[session_id]
+
+_session_locks = LockCache()
+
+def get_session_lock(session_id: str) -> asyncio.Lock:
+    return _session_locks.get_lock(session_id)
 
 
 # ── Agent endpoints ──
@@ -138,7 +161,7 @@ async def ask(request: Request, body: AskRequest):
     result = await run_query(body.query, session_id=session_id,
                              response_format=body.response_format, model_id=body.model_id,
                              user_id=user_id)
-    response = _fix_math_delimiters(result["response"])
+    response = result["response"]
     steps = result["steps"]
 
     await MongoDB.save_conversation(
@@ -175,10 +198,9 @@ async def ask_stream(request: Request, body: AskRequest):
     logger.info("POST /ask/stream — session='%s', user='%s', query='%s'",
                 session_id, user_id or "anonymous", body.query[:100])
 
-    raw_stream = await create_stream(body.query, session_id=session_id,
+    stream = await create_stream(body.query, session_id=session_id,
                                      response_format=body.response_format, model_id=body.model_id,
                                      user_id=user_id)
-    stream = StreamingMathFixer(raw_stream)
 
     _STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT_SECONDS", "300"))
 
@@ -197,9 +219,10 @@ async def ask_stream(request: Request, body: AskRequest):
 
         async def agent_worker():
             try:
-                async with asyncio.timeout(_STREAM_TIMEOUT):
-                    async for chunk in StreamingMathFixer(raw_stream):
-                        await queue.put(chunk)
+                async with get_session_lock(session_id):
+                    async with asyncio.timeout(_STREAM_TIMEOUT):
+                        async for chunk in stream:
+                            await queue.put(chunk)
             except TimeoutError:
                 logger.error("Stream timed out after %.0fs", _STREAM_TIMEOUT)
                 await queue.put(f"__ERROR__:Response timed out after {_STREAM_TIMEOUT:.0f} seconds.")
@@ -240,7 +263,7 @@ async def ask_stream(request: Request, body: AskRequest):
                 save_memory(user_id=user_id or session_id, query=body.query, response=response_text)
                 await MongoDB.save_conversation(
                     session_id=session_id, query=body.query, response=response_text,
-                    steps=raw_stream.steps, user_id=user_id, plan=raw_stream.plan,
+                    steps=stream.steps, user_id=user_id, plan=stream.plan,
                 )
             except Exception as e:
                 logger.error("Failed to save conversation: %s", e)
