@@ -7,6 +7,7 @@ import asyncio
 from agent_sdk.agents import BaseAgent
 from agent_sdk.checkpoint import AsyncMongoDBSaver
 from agent_sdk.database.memory import get_memories, save_memory
+from database.mongo import MongoDB
 
 logger = logging.getLogger("agent_news.agent")
 
@@ -68,6 +69,30 @@ Structure briefings using this format:
 
 For each story, always include the "Why it matters" line. Group stories by theme \
 (e.g. ## Technology, ## Geopolitics, ## Markets, ## Science).
+
+## Personalized Briefings
+
+When user preferences are in [CONTEXT] (topics, regions, interests):
+- **Lead with their interests:** If the user follows markets, put financial news first. If they care about tech, tech goes at the top.
+- **Skip what they've marked irrelevant:** If a user said they don't care about sports, omit sports unless it crosses into business.
+- **Reference their preferences explicitly:** "You follow Indian markets — here's what moved today."
+- For general "what's happening" queries, use their preference topics as search terms alongside general news.
+
+## Impact Analysis
+
+When a news event has clear market or financial implications:
+1. After presenting the news, add a section: **## Market Impact**
+2. Call `tavily_quick_search` with a query like "[event] impact on [sector] stocks" to find analyst reactions
+3. List: affected sectors, specific Indian/global tickers likely impacted, direction (positive/negative), and magnitude
+4. Example: "RBI rate cut → positive for HDFC Bank, Kotak Bank, NBFCs; negative for fixed income funds"
+5. Only add this section when the event has clear, non-speculative market linkages (policy changes, sector news, earnings, geopolitical events)
+
+## Research Discovery
+
+When a news story mentions a scientific finding, new technology, or research breakthrough:
+1. At the end of the story summary, add: **📚 Go Deeper**
+2. Suggest 1-2 search terms the user can explore in the Research Agent: "Want to go deeper? The Research Agent can find academic papers on '[suggested search term]'"
+3. Keep it brief — one line maximum. Don't derail the news briefing.
 
 ## Style Rules
 
@@ -175,14 +200,21 @@ _TRIVIAL_FOLLOWUPS: frozenset[str] = frozenset({
 
 async def _build_dynamic_context(session_id: str, query: str, response_format: str | None = None,
                             user_id: str | None = None) -> str:
-    """Build dynamic context block (date, memories, format instructions) to prepend to the user query."""
+    """Build dynamic context block (date, memories, preferences) to prepend to the user query."""
     mem_key = user_id or session_id
     mem_err: str | None = None
-    # Skip Mem0 search for trivial follow-ups — "Yes" has no semantic content to match against.
-    if query.strip().lower() not in _TRIVIAL_FOLLOWUPS and len(query.strip()) > 10:
-        memories, mem_err = await asyncio.to_thread(get_memories, user_id=mem_key, query=query)
-    else:
-        memories = []
+
+    async def _get_mem():
+        if query.strip().lower() not in _TRIVIAL_FOLLOWUPS and len(query.strip()) > 10:
+            return await asyncio.to_thread(get_memories, user_id=mem_key, query=query)
+        return [], None
+
+    async def _get_prefs():
+        if user_id:
+            return await MongoDB.get_preferences(user_id)
+        return None
+
+    (memories, mem_err), preferences = await asyncio.gather(_get_mem(), _get_prefs())
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     year = today[:4]
@@ -190,14 +222,31 @@ async def _build_dynamic_context(session_id: str, query: str, response_format: s
     parts = []
     parts.append(
         f"Today's date: {today}. Always include the current year ({year}) and today's date "
-        "in search queries to get the most recent news (e.g. 'AI regulation news {today}')."
+        f"in search queries to get the most recent news (e.g. 'AI regulation news {today}')."
     )
+
+    # Inject stored preferences (explicit topics/regions the user cares about)
+    if preferences:
+        pref_parts = []
+        if preferences.get("topics"):
+            pref_parts.append(f"Topics of interest: {', '.join(preferences['topics'])}")
+        if preferences.get("regions"):
+            pref_parts.append(f"Regions of focus: {', '.join(preferences['regions'])}")
+        if preferences.get("excluded_topics"):
+            pref_parts.append(f"Topics to exclude: {', '.join(preferences['excluded_topics'])}")
+        if preferences.get("market_tickers"):
+            pref_parts.append(f"Tracked tickers/assets: {', '.join(preferences['market_tickers'])}")
+        if pref_parts:
+            parts.append(
+                "User's news preferences (stored settings — always honor these):\n"
+                + "\n".join(f"- {p}" for p in pref_parts)
+            )
 
     if memories:
         memory_lines = "\n".join(f"- {m}" for m in memories)
         parts.append(
-            f"User's news preferences and interests (from past conversations):\n{memory_lines}\n"
-            "Use these to personalize coverage when relevant — prioritize topics the user cares about."
+            f"User's interests (from past conversations):\n{memory_lines}\n"
+            "Use these to personalize coverage when relevant."
         )
         logger.info("Injected %d memories into context for session='%s'", len(memories), session_id)
 
@@ -249,7 +298,6 @@ async def stream_for_a2a(query: str, *, session_id: str = "default",
                          response_format: str | None = None, model_id: str | None = None,
                          **kwargs):
     """Async generator for the A2A StreamingAgentExecutor. Streams chunks and saves to DB."""
-    from database.mongo import MongoDB
     dynamic_context = await _build_dynamic_context(session_id, query, response_format=response_format, user_id=user_id)
     enriched_query = dynamic_context + query
     system_prompt = _build_system_prompt(response_format)

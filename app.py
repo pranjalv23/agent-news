@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -309,6 +310,50 @@ async def get_history_by_sessions(request: Request, body: SessionsHistoryRequest
     logger.info("POST /history/sessions — %d session(s)", len(safe_ids))
     history = await MongoDB.get_history_by_sessions(safe_ids, user_id=user_id)
     return {"history": history}
+
+
+# ── User preferences endpoints ──
+
+class NewsPreferencesRequest(BaseModel):
+    topics: list[str] = Field(
+        default_factory=list,
+        description="News topics of interest (e.g. ['technology', 'Indian markets', 'climate']).",
+    )
+    regions: list[str] = Field(
+        default_factory=list,
+        description="Geographic regions to prioritize (e.g. ['India', 'US', 'EU']).",
+    )
+    excluded_topics: list[str] = Field(
+        default_factory=list,
+        description="Topics to exclude from briefings (e.g. ['sports', 'celebrity']).",
+    )
+    market_tickers: list[str] = Field(
+        default_factory=list,
+        description="Stock/asset tickers to track for market news (e.g. ['RELIANCE.NS', 'NIFTY']).",
+    )
+
+
+@app.post("/preferences")
+@limiter.limit("20/minute")
+async def save_preferences(body: NewsPreferencesRequest, request: Request):
+    """Save or update user news preferences."""
+    user_id = request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    await MongoDB.save_preferences(user_id=user_id, preferences=body.model_dump())
+    logger.info("Saved news preferences for user='%s'", user_id)
+    return {"success": True}
+
+
+@app.get("/preferences")
+@limiter.limit("60/minute")
+async def get_preferences(request: Request):
+    """Retrieve user news preferences."""
+    user_id = request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    prefs = await MongoDB.get_preferences(user_id)
+    return {"preferences": prefs or {}}
 
 
 @app.get("/metrics")
