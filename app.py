@@ -18,7 +18,6 @@ from slowapi.util import get_remote_address
 from agent_sdk.logging import configure_logging
 from agent_sdk.context import request_id_var, user_id_var
 from agent_sdk.metrics import metrics_response
-from agent_sdk.metrics import metrics_response
 from agents.agent import create_agent, run_query, create_stream, save_memory
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
@@ -116,23 +115,27 @@ class HistoryResponse(BaseModel):
     session_id: str
     history: list[dict]
 
+import threading
+
 class LockCache:
     def __init__(self, ttl: int = 3600):
         self._locks = {}
         self._timestamps = {}
         self._ttl = ttl
+        self._mutex = threading.Lock()
 
     def get_lock(self, session_id: str) -> asyncio.Lock:
-        now = time.time()
-        expired = [sid for sid, ts in self._timestamps.items() if now - ts > self._ttl]
-        for sid in expired:
-            if sid in self._locks and not self._locks[sid].locked():
-                del self._locks[sid]
-                del self._timestamps[sid]
-        if session_id not in self._locks:
-            self._locks[session_id] = asyncio.Lock()
-        self._timestamps[session_id] = now
-        return self._locks[session_id]
+        with self._mutex:
+            now = time.time()
+            expired = [sid for sid, ts in self._timestamps.items() if now - ts > self._ttl]
+            for sid in expired:
+                if sid in self._locks and not self._locks[sid].locked():
+                    del self._locks[sid]
+                    del self._timestamps[sid]
+            if session_id not in self._locks:
+                self._locks[session_id] = asyncio.Lock()
+            self._timestamps[session_id] = now
+            return self._locks[session_id]
 
 _session_locks = LockCache()
 
@@ -214,7 +217,7 @@ async def ask_stream(request: Request, body: AskRequest):
             try:
                 while True:
                     await asyncio.sleep(_HEARTBEAT_INTERVAL)
-                    await queue.put(f": heartbeat {int(asyncio.get_event_loop().time())}\n\n")
+                    await queue.put(f": heartbeat {int(asyncio.get_running_loop().time())}\n\n")
             except asyncio.CancelledError:
                 pass
 
