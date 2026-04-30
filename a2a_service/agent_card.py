@@ -1,6 +1,6 @@
 import os
 
-from a2a.types import AgentCard, AgentSkill, AgentCapabilities
+from a2a.types import AgentCard, AgentCapabilities, AgentInterface, AgentSkill
 
 
 NEWS_AGENT_CARD = AgentCard(
@@ -10,7 +10,12 @@ NEWS_AGENT_CARD = AgentCard(
         "Covers world affairs, technology, finance, science, politics, sports, and more. "
         "Searches multiple sources, presents diverse perspectives, and explains why stories matter."
     ),
-    url=os.getenv("AGENT_PUBLIC_URL", "http://localhost:9004"),
+    supported_interfaces=[
+        AgentInterface(
+            url=os.getenv("AGENT_PUBLIC_URL", "http://localhost:9004"),
+            protocol_binding="JSONRPC",
+        )
+    ],
     version="1.0.0",
     skills=[
         AgentSkill(
@@ -32,7 +37,7 @@ NEWS_AGENT_CARD = AgentCard(
             tags=["news", "monitoring", "tracking", "updates"],
         ),
     ],
-    defaultInputModes=["text"],
-    defaultOutputModes=["text"],
-    capabilities=AgentCapabilities(streaming=True, pushNotifications=False),
+    default_input_modes=["text"],
+    default_output_modes=["text"],
+    capabilities=AgentCapabilities(streaming=True, push_notifications=False),
 )
