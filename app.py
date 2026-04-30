@@ -62,7 +62,7 @@ app.mount("/a2a", a2a_app.build())
 
 @app.post("/ask", response_model=AskResponse)
 @limiter.limit("30/minute")
-async def ask(request: Request, body: AskRequest):
+async def ask(body: AskRequest, request: Request):
     user_id = request.headers.get("X-User-Id") or None
     is_new = body.session_id is None
     session_id = body.session_id or MongoDB.generate_session_id()
